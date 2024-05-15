@@ -1,20 +1,21 @@
+import os
+import shutil
+import time
+from pathlib import Path
+import logging
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+
 from selenium import webdriver
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.edge.options import Options
-import re
-import pandas as pd
-from bs4 import BeautifulSoup
-import shutil
-import os
-from pathlib import Path
-import requests
-import logging
-from concurrent.futures import ThreadPoolExecutor
 
 # Логи
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Поиск слова
+import re
 pattern = re.compile(r'\w+')
 
 # Настройка браузера ссылок и путей файлов
@@ -22,7 +23,6 @@ options = Options()
 options.headless = True
 driver = webdriver.Edge(options=options)
 url = 'https://www.vishay.com/en/inductors/'
-#url_3d = 'https://www.vishay.com/en/how/design-support-tools/?category=60'
 save_path = str(Path(__file__).parent.resolve())
 img_small_save_path = os.path.join(save_path, "image", "small_inductors")
 datasheet_save_path = os.path.join(save_path, "Datasheet")
@@ -50,21 +50,70 @@ def get_web(u):
         option.click()
         return driver.page_source
 
-# Функция для скачивания файлов.
-def download_file(url, path, headers=None):
+# Функция для скачивания файлов с повторными попытками
+def download_file_with_retry(url, path, headers=None):
+    time.sleep(0.3)
+    retries = 3
+    for _ in range(retries):
+        try:
+            with requests.get(url, headers=headers, stream=True) as response:
+                response.raise_for_status()
+                file_dir = os.path.dirname(path)
+                Path(file_dir).mkdir(parents=True, exist_ok=True)
+                if not os.path.exists(path):
+                    with open(path, 'wb') as out_file:
+                        shutil.copyfileobj(response.raw, out_file)
+                    logging.info(f'Файл {os.path.basename(path)} успешно загружен и сохранен.')
+                else:
+                    logging.info(f'Файл {os.path.basename(path)} уже существует.')
+                return True  # Возвращаем успешное завершение загрузки
+        except Exception as e:
+            logging.error(f'Ошибка при загрузке файла {url}: {e}')
+            logging.info(f'Повторная попытка загрузки файла {url}...')
+            continue
+    return False  # Возвращаем неудачное завершение загрузки после всех попыток
+
+# Функция для скачивания изображений с повторными попытками
+def download_image_with_retry(url, path, headers=None):
+    time.sleep(0.3)
+    retries = 3
+    for _ in range(retries):
+        try:
+            with requests.get(url, headers=headers, stream=True) as response:
+                response.raise_for_status()
+                file_dir = os.path.dirname(path)
+                Path(file_dir).mkdir(parents=True, exist_ok=True)
+                if not os.path.exists(path):
+                    with open(path, 'wb') as out_file:
+                        shutil.copyfileobj(response.raw, out_file)
+                    logging.info(f'Изображение {os.path.basename(path)} успешно загружено и сохранено.')
+                else:
+                    logging.info(f'Изображение {os.path.basename(path)} уже существует.')
+                return True  # Возвращаем успешное завершение загрузки
+        except Exception as e:
+            logging.error(f'Ошибка при загрузке изображения {url}: {e}')
+            logging.info(f'Повторная попытка загрузки изображения {url}...')
+            continue
+    return False  # Возвращаем неудачное завершение загрузки после всех попыток
+
+def download_3d_model_with_retry(img_alt, file_3d_path):
     try:
-        response = requests.get(url, headers=headers, stream=True)
-        file_dir = os.path.dirname(path)
-        Path(file_dir).mkdir(parents=True, exist_ok=True)
-        if not os.path.exists(path):
-            with open(path, 'wb') as out_file:
-                shutil.copyfileobj(response.raw, out_file)
-            logging.info(f'Файл {os.path.basename(path)} успешно загружен и сохранен.')
-        else:
-            logging.info(f'Файл {os.path.basename(path)} уже существует.')
-    except Exception as e:
-        logging.error(f'Ошибка при загрузке файла {url}: {e}')
-    del response
+        with requests.get('https://www.vishay.com/en/product/' + img_alt + '/tab/designtools-ppg/', stream=True, headers=headers, timeout=10) as response:
+            response.raise_for_status()
+            if response.status_code == 200:
+                soupp = BeautifulSoup(response.content, "lxml")
+                file_3d_cont = []
+                for a in soupp.findAll('a', href=True):
+                    file_3d_cont.append(a['href'])
+
+                for b in file_3d_cont:
+                    if b.endswith('_3dmodel.zip'):
+                        return download_file_with_retry('https://www.vishay.com/' + b, file_3d_path, headers)
+            return False  # Не удалось найти 3D модель
+    except requests.exceptions.RequestException as e:
+        logging.error(f'Ошибка при получении 3D модели для продукта {img_alt}: {e}')
+        return False  # Не удалось получить 3D модель
+    return False  # Не удалось получить 3D модель
 
 # Функция для обработки HTML и запуска параллельной загрузки.
 def process_html(html_source):
@@ -78,71 +127,52 @@ def process_html(html_source):
     img_src = []
     datasheet_src = []
     file_3d_src = []
-    download_tasks = []
     previous_img_src = ''
     previous_datasheet_src = ''
+    file_3d_exsist = False
     i = 0
-    file_3d_download_prob = False
     imgpr = ''
 
+    for img in images:
+        series = df['Series▲▼'][i]
+        if img['src'].split('/')[-2] == 'pt-small':
+            img_filename = img['alt'] + '.png'
+            img_path = os.path.join(img_small_save_path, img_filename)
+            img_src.append(img_path)
+            if previous_img_src != img['src'] and img['alt'] != "Datasheet":
+                download_image_with_retry('https://www.vishay.com/' + img['src'], img_path, headers)
+                previous_img_src = img['src']
+
+            datasheet_filename = series + '.pdf'
+            file_3d_name = series+'.zip'
+            datasheet_path = os.path.join(datasheet_save_path, series, datasheet_filename)
+            file_3d_path = os.path.join(datasheet_save_path,series,file_3d_name)
+            datasheet_src.append(datasheet_path)
+
+            if previous_datasheet_src != series and img['alt'] != "Datasheet":
+                download_file_with_retry('https://www.vishay.com/doc?' + img['alt'], datasheet_path, headers)
+                if download_3d_model_with_retry(img['alt'], file_3d_path) == True:
+                    file_3d_exsist == True
 
 
-    # ThreadPoolExecutor для параллельной загрузки.
-    with ThreadPoolExecutor(max_workers=5) as executor:
-    # Разгрузка
-        for img in images:
-            series = df['Series▲▼'][i]
-            if img['src'].split('/')[-2] == 'pt-small':
-                img_filename = img['alt'] + '.png'
-                img_path = os.path.join(img_small_save_path, img_filename)
-                img_src.append(img_path)
-                if previous_img_src != img['src'] and img['alt'] != "Datasheet":
-                    download_tasks.append(executor.submit(download_file, 'https://www.vishay.com/' + img['src'], img_path, headers))
-                    previous_img_src = img['src']
+            if file_3d_exsist==True:
+                file_3d_src.append(file_3d_path)
+            else:
+                file_3d_src.append('3Д модели нету')
 
-                datasheet_filename = series + '.pdf'
-                file_3d_name = series+'.zip'
-                datasheet_path = os.path.join(datasheet_save_path, series, datasheet_filename)
-                file_3d_path = os.path.join(datasheet_save_path,series,file_3d_name)
-                datasheet_src.append(datasheet_path)
+            if series != previous_datasheet_src:
+                file_3d_exsist = False
 
-                if requests.get('https://www.vishay.com/en/product/' + img['alt'] + '/tab/designtools-ppg/').status_code == 200 and imgpr != img['alt']:
+            imgpr = img['alt']
 
-                    soupp = BeautifulSoup(requests.get('https://www.vishay.com/en/product/' + img['alt'] + '/tab/designtools-ppg/').content, "lxml")
-                    file_3d_cont = []
-                    for a in soupp.findAll('a', href=True):
-                        file_3d_cont.append(a['href'])
+            previous_datasheet_src = series
+            i += 1
 
-                    for b in file_3d_cont:
-                        if b[-12:] == '_3dmodel.zip':
-                            download_tasks.append(executor.submit(download_file, 'https://www.vishay.com/' + b, file_3d_path, headers))
-                            print(file_3d_path)
-
-                    del file_3d_cont
-                    file_3d_src.append(file_3d_path)
-
-                else:
-                    file_3d_src.append("Нету 3Д модели")
-
-
-
-
-                i += 1
-                if previous_datasheet_src != series and img['alt'] != "Datasheet":
-                    download_tasks.append(executor.submit(download_file, 'https://www.vishay.com/doc?' + img['alt'], datasheet_path, headers))
-                    previous_datasheet_src = series
-                    imgpr = img['alt']
-
-
-
-    # Ожидаем завершения всех задач загрузки.
-    for task in download_tasks:
-        task.result()
 
     return df, img_src, datasheet_src, file_3d_src
 
 # Функция для сохранения данных в Excel.
-def save_to_excel(df, img_src, datasheet_src, save_path, url):
+def save_to_excel(df, img_src, datasheet_src, file_3d_src, save_path, url):
     excel_path = os.path.join(save_path, url.split('/')[-2] + '.xlsx')
     with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
         df_img = pd.DataFrame(img_src, columns=['Product Image'])
@@ -153,11 +183,12 @@ def save_to_excel(df, img_src, datasheet_src, save_path, url):
         worksheet = writer.sheets['Inductors']
         worksheet.autofit()
 
-# Проверка работает ли всё
+# Остальной код остается неизменным
+
 try:
     web_source = get_web(url)
     df, img_src, datasheet_src, file_3d_src = process_html(web_source)
-    save_to_excel(df, img_src, datasheet_src, save_path, url)
+    save_to_excel(df, img_src, datasheet_src, file_3d_src, save_path, url)
     logging.info('Данные успешно сохранены.')
 finally:
     driver.quit()
